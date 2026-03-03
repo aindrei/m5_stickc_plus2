@@ -23,6 +23,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <ctype.h>
 #include <time.h>
 
 #define DEBUG_SERIAL 1
@@ -52,9 +53,9 @@ static const char* NTP_2 = "time.nist.gov";
 static const char* TZ_INFO = "PST8PDT,M3.2.0/2,M11.1.0/2";
 
 // ====== UI ======
-static const int ROTATION = 1; // landscape
-static const int W = 240;
-static const int H = 135;
+static const int ROTATION = 0; // portrait
+static const int W = 135;
+static const int H = 240;
 
 // ====== DATA MODEL ======
 struct DayForecast {
@@ -71,6 +72,7 @@ struct WeatherState {
   float currentTempC = NAN;
   float currentWindKph = NAN;
   float currentWindDirDeg = NAN;
+  int currentWeatherCode = 0;
   DayForecast days[4]; // today + next 3
   uint32_t lastFetchMs = 0;
   char placeName[48] = "91361";
@@ -169,6 +171,7 @@ static bool fetchOpenMeteo(float lat, float lon, WeatherState &out) {
   out.currentTempC    = doc["current"]["temperature_2m"] | NAN;
   out.currentWindKph  = doc["current"]["windspeed_10m"] | NAN;
   out.currentWindDirDeg = doc["current"]["winddirection_10m"] | NAN;
+  out.currentWeatherCode = doc["current"]["weather_code"] | 0;
 
   JsonArray times = doc["daily"]["time"].as<JsonArray>();
   JsonArray wc    = doc["daily"]["weather_code"].as<JsonArray>();
@@ -295,102 +298,146 @@ static void drawWindArrow(int cx, int cy, float dirDeg, uint16_t color) {
   d.drawLine(x2, y2, xh2, yh2, color);
 }
 
-static void drawHeader(const WeatherState& ws) {
+
+static void drawWindGlyph(int x, int y, uint16_t color) {
+  // Simple "wind" glyph: three lines
   auto &d = StickCP2.Display;
-  d.fillRect(0, 0, W, 28, TFT_BLACK);
+  d.drawLine(x, y, x + 12, y, color);
+  d.drawLine(x + 3, y + 4, x + 15, y + 4, color);
+  d.drawLine(x, y + 8, x + 10, y + 8, color);
+  // tiny accents
+  d.drawPixel(x + 12, y - 1, color);
+  d.drawPixel(x + 15, y + 3, color);
+}
+
+
+static void drawCurrentDay(const WeatherState& ws) {
+  // Top area styled like the reference (icon + big temp, then hi/lo + wind)
+  auto &d = StickCP2.Display;
+
+  const int topH = 116;
+  d.fillRect(0, 0, W, topH, TFT_BLACK);
+
+  // Current condition icon (left)
+  drawIcon(iconFromWmo(ws.currentWeatherCode), 10, 18);
+
+  // Big temperature (right) - increased size to 6
   d.setTextColor(TFT_WHITE, TFT_BLACK);
-  d.setTextSize(1);
-
-  d.setCursor(6, 6);
-  d.print(ws.placeName);
-
-  // time
-  struct tm t;
-  if (getLocalTime(&t, 10)) {
-    char buf[16];
-    strftime(buf, sizeof(buf), "%a %I:%M%p", &t);
-    d.setCursor(120, 6);
-    d.print(buf);
-  }
-
-  // current temp
-  d.setCursor(6, 16);
-  if (isnan(ws.currentTempC)) {
-    d.print("Now: --.-C");
+  d.setTextSize(5);
+  int tempX = 50;
+  int tempY = 12;
+  d.setCursor(tempX, tempY);
+  if (!isnan(ws.currentTempC)) {
+    d.printf("%.0f", ws.currentTempC);
   } else {
-    d.printf("Now: %.1fC", ws.currentTempC);
+    d.print("--");
   }
+  d.setTextSize(3);
+  d.print("o"); // degree symbol using 'o' which is more reliable on bitmap fonts
 
-  // current wind
-  d.setCursor(120, 16);
-  if (isnan(ws.currentWindKph) || isnan(ws.currentWindDirDeg)) {
-    d.print("Wind: --");
-  } else {
-    d.printf("Wind: %.0f", ws.currentWindKph);
-    drawWindArrow(200, 20, ws.currentWindDirDeg, TFT_WHITE);
-  }
+  // Small line with hi / lo / wind
+  const DayForecast& today = ws.days[0];
+  int yInfo = 78;
+  d.setTextSize(2);
 
-  // separator
-  d.drawFastHLine(0, 28, W, TFT_DARKGREY);
+  // High (red)
+  d.setTextColor(TFT_RED, TFT_BLACK);
+  d.setCursor(8, yInfo);
+  if (!isnan(today.tMaxC)) d.printf("%.0f", today.tMaxC);
+  else d.print("--o");
+
+  // Divider slash
+  d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  d.setCursor(36, yInfo);
+  d.print("/");
+
+  // Low (cyan)
+  d.setTextColor(TFT_CYAN, TFT_BLACK);
+  d.setCursor(50, yInfo);
+  if (!isnan(today.tMinC)) d.printf("%.0f", today.tMinC);
+  else d.print("--");
+
+  // Wind glyph + speed
+  int windX = 82;
+  drawWindGlyph(windX, yInfo + 2, TFT_LIGHTGREY);
+  d.setTextColor(TFT_WHITE, TFT_BLACK);
+  d.setCursor(windX + 18, yInfo);
+  if (!isnan(ws.currentWindKph)) d.printf("%.0f", ws.currentWindKph);
+  else d.print("--");
+
+  d.drawFastHLine(0, topH, W, TFT_DARKGREY);
 }
 
 static void drawForecastRow(int row, const DayForecast& df) {
-  // rows start at y=32
+  // Row "pill" styled like the reference image
   auto &d = StickCP2.Display;
-  int y = 32 + row * 25;
 
-  // clear row band
-  d.fillRect(0, y, W, 25, TFT_BLACK);
-  if (row % 2 == 1) d.fillRect(0, y, W, 25, TFT_BLACK); // keep simple (same bg)
+  const int topH = 116;
+  const int rowH = 34;
+  const int gap  = 4;
 
-  // day label
+  int y = topH + gap + row * (rowH + gap);
+
+  // Clear band
+  d.fillRect(0, y, W, rowH, TFT_BLACK);
+
+  // Rounded card
+  int cardX = 8;
+  int cardW = W - 16;
+  //uint16_t cardBg = 0x2104; // very dark grey
+  //d.fillRoundRect(cardX, y, cardW, rowH, 10, cardBg);
+
+  // Day label (uppercase)
   int dow = dowFromYYYYMMDD(df.date);
+  const char* label = dowLabel(dow);
+  char up[4] = {0};
+  up[0] = toupper(label[0]);
+  up[1] = toupper(label[1]);
+  up[2] = toupper(label[2]);
+
+  d.setTextSize(2);
   d.setTextColor(TFT_WHITE, TFT_BLACK);
-  d.setCursor(6, y + 6);
-  if (row == 0) d.print("Today");
-  else d.print(dowLabel(dow));
+  d.setCursor(cardX, y + 10);
+  d.print(up);
 
-  // icon
-  drawIcon(iconFromWmo(df.weatherCode), 62, y + 1);
+  // Icon
+  drawIcon(iconFromWmo(df.weatherCode), cardX + 38, y);
 
-  // temps
-  d.setCursor(105, y + 6);
-  if (isnan(df.tMaxC) || isnan(df.tMinC)) {
-    d.print("--/--C");
-  } else {
-    d.printf("%.0f/%.0fC", df.tMaxC, df.tMinC);
-  }
+  // Temps on right: high then low
+  int xHigh = cardX + cardW - 38;
+  int xLow  = cardX + cardW - 12;
+  int yTemp = y + 10;
 
-  // wind
-  d.setCursor(165, y + 6);
-  if (isnan(df.windMaxKph) || isnan(df.windDirDeg)) {
-    d.print("--");
-  } else {
-    d.printf("%.0f", df.windMaxKph);
-    drawWindArrow(225, y + 12, df.windDirDeg, TFT_WHITE);
-  }
+  d.setTextColor(TFT_RED, TFT_BLACK);
+  d.setCursor(xHigh, yTemp);
+  if (!isnan(df.tMaxC)) d.printf("%.0f", df.tMaxC);
+  else d.print("--");
 
-  // subtle divider
-  d.drawFastHLine(0, y + 24, W, TFT_DARKGREY);
+  d.setTextColor(TFT_CYAN, TFT_BLACK);
+  d.setCursor(xLow, yTemp);
+  if (!isnan(df.tMinC)) d.printf("%.0f", df.tMinC);
+  else d.print("--");
 }
 
 static void drawScreen(const WeatherState& ws) {
-  drawHeader(ws);
+  // Top half: current day
+  drawCurrentDay(ws);
 
-  for (int i = 0; i < 4; i++) {
-    drawForecastRow(i, ws.days[i]);
+  // Bottom half: next 3 days (days 1, 2, 3 - skipping today which is day 0)
+  for (int i = 1; i < 4; i++) {
+    drawForecastRow(i - 1, ws.days[i]);
   }
 
   // footer status
-  auto &d = StickCP2.Display;
+  /*auto &d = StickCP2.Display;
   d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  d.setCursor(6, 132 - 10);
+  d.setCursor(6, 232);
   if (!ws.ok) {
     d.print("No data (check WiFi)");
   } else {
     uint32_t age = (millis() - ws.lastFetchMs) / 1000;
     d.printf("Updated %lus ago", (unsigned long)age);
-  }
+  }*/
 }
 
 // ====== APP LOGIC ======
